@@ -1,4 +1,6 @@
 data/
+models/
 __pycache__/
 *.pyc
 *.zip
+.venv/

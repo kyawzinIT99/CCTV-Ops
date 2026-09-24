@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 from openpyxl import Workbook, load_workbook
+from recognizer import decode_image, feature_for_image, match_frame
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -169,6 +170,36 @@ CREATE TABLE IF NOT EXISTS project_discovery (
 def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+VISIT_GAP_SECONDS = 10 * 60
+
+def record_sighting(con: sqlite3.Connection, project_id: int, device_name: str, coverage_role: str, found: dict, actor: str) -> dict:
+    now=utcnow()
+    direction={"Entrance":"Entry","Exit":"Exit"}.get(coverage_role,"Unknown")
+    label=f"{found['name']} · {found['category']}"
+    recent=con.execute("SELECT id,last_seen FROM movement_events WHERE project_id=? AND person_id=? AND last_camera=? ORDER BY last_seen DESC LIMIT 1",(project_id,found["person_id"],device_name)).fetchone()
+    continued=False
+    movement_id=None
+    if recent and recent["last_seen"]:
+        try:
+            last=datetime.fromisoformat(recent["last_seen"])
+            if last.tzinfo is None: last=last.replace(tzinfo=timezone.utc)
+            continued=(datetime.now(timezone.utc)-last).total_seconds()<VISIT_GAP_SECONDS
+        except ValueError:
+            continued=False
+    if continued:
+        movement_id=recent["id"]
+        con.execute("UPDATE movement_events SET last_seen=?,match_score=? WHERE id=? AND project_id=?",(now,round(found["score"],3),movement_id,project_id))
+    else:
+        cur=con.execute("INSERT INTO movement_events(project_id,event_reference,direction,first_camera,last_camera,first_seen,last_seen,review_status,person_id,person_label,match_score,created_at) VALUES(?,?,?,?,?,?,?,'Unreviewed',?,?,?,?)",(project_id,uuid.uuid4().hex[:12],direction,device_name,device_name,now,now,found["person_id"],label,round(found["score"],3),now))
+        movement_id=cur.lastrowid
+        if found["category"]=="Watchlist":
+            summary=f"Watchlist face matched on {device_name} at {now}. Review before any message is sent."
+            alert=con.execute("INSERT INTO alerts(project_id,source,occurred_at,summary,status,created_at,updated_at) VALUES(?,?,?,?,'Needs review',?,?)",(project_id,device_name,now,summary,now,now))
+            queue_automation_event(con,project_id,"alert.created","alert",alert.lastrowid,"needs_review")
+        record_audit(con,actor,"matched","movement",movement_id,f"person_id={found['person_id']}; category={found['category']}; direction={direction}",project_id)
+        queue_automation_event(con,project_id,"movement.matched","movement",movement_id,direction.lower())
+    return {"matched":True,"continued":continued,"person":found["name"],"category":found["category"],"direction":direction,"score":round(found["score"],3),"seen_at":now,"camera":device_name,"review_alert":found["category"]=="Watchlist" and not continued}
+
 def db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=10)
@@ -187,12 +218,16 @@ def db() -> sqlite3.Connection:
     if "coverage_role" not in device_cols:con.execute("ALTER TABLE devices ADD COLUMN coverage_role TEXT NOT NULL DEFAULT 'General'")
     if "source_mode" not in device_cols:con.execute("ALTER TABLE devices ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'Recorder'")
     if "monitoring_purposes" not in device_cols:con.execute("ALTER TABLE devices ADD COLUMN monitoring_purposes TEXT NOT NULL DEFAULT '[]'")
+    if "stream_url" not in device_cols:con.execute("ALTER TABLE devices ADD COLUMN stream_url TEXT NOT NULL DEFAULT ''")
     people_cols={row[1] for row in con.execute("PRAGMA table_info(people)")}
     if "position" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN position TEXT NOT NULL DEFAULT ''")
     if "photo_blob" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN photo_blob BLOB")
     if "photo_mime" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN photo_mime TEXT NOT NULL DEFAULT ''")
     movement_cols={row[1] for row in con.execute("PRAGMA table_info(movement_events)")}
     if "direction" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN direction TEXT NOT NULL DEFAULT 'Unknown'")
+    if "person_id" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN person_id INTEGER")
+    if "person_label" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN person_label TEXT NOT NULL DEFAULT ''")
+    if "match_score" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN match_score REAL")
     user_cols={row[1] for row in con.execute("PRAGMA table_info(users)")}
     if "permissions" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
     if "active" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -476,8 +511,12 @@ class Handler(BaseHTTPRequestHandler):
                 record_audit(con,sess["username"],"downloaded","backup",None,name,project_for_event);queue_automation_event(con,project_for_event,"backup.downloaded","backup",None,"downloaded");con.commit()
                 body=file.read_bytes();self.send_response(200);self.send_header("Content-Type","application/vnd.sqlite3");self.send_header("Content-Length",str(len(body)));self.send_header("Content-Disposition",f'attachment; filename="{name}"');self.security_headers();self.end_headers();self.wfile.write(body);return
             project_id=selected_project(self,con)
-            if not project_id: return self.send_json(400,{"error":"Select a valid CCTV project"})
             photo_parts=path.strip("/").split("/")
+            if not project_id and len(photo_parts)==4 and photo_parts[3]=="photo":
+                query_project=parse_qs(urlparse(self.path).query).get("project",[""])[0]
+                if query_project.isdigit() and con.execute("SELECT 1 FROM projects WHERE id=?",(int(query_project),)).fetchone():
+                    project_id=int(query_project)
+            if not project_id: return self.send_json(400,{"error":"Select a valid CCTV project"})
             if len(photo_parts)==4 and photo_parts[:2]==["api","people"] and photo_parts[2].isdigit() and photo_parts[3]=="photo":
                 if not self.require_permission(sess,"view_people"):return
                 row=con.execute("SELECT photo_blob,photo_mime FROM people WHERE id=? AND project_id=?",(int(photo_parts[2]),project_id)).fetchone()
@@ -513,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
                     result=[]
                     for row in rows:
                         item=dict(row)
+                        item["stream_configured"]=bool((item.get("stream_url") or "").strip())
+                        item.pop("stream_url", None)
                         try:item["monitoring_purposes"]=json.loads(item.get("monitoring_purposes") or "[]")
                         except (TypeError,json.JSONDecodeError):item["monitoring_purposes"]=[]
                         result.append(item)
@@ -548,6 +589,9 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute("UPDATE people SET photo_blob=?,photo_mime=?,updated_at=? WHERE id=? AND project_id=?",(sqlite3.Binary(body),mime,utcnow(),person_id,project_id))
                 record_audit(con,sess["username"],"photo_added","person",person_id,"Profile photo uploaded",project_id);queue_automation_event(con,project_id,"person.photo_added","person",person_id,"photo_added");con.commit()
                 return self.send_json(200,{"ok":True})
+            scan_parts=path.strip("/").split("/")
+            if len(scan_parts)==4 and scan_parts[:2]==["api","devices"] and scan_parts[2].isdigit() and scan_parts[3]=="scan":
+                return self.scan_device(con,sess,int(scan_parts[2]))
             if path=="/api/people/import.xlsx": return self.import_people(con,sess)
             try: data=self.read_json()
             except ValueError as e: return self.send_json(400,{"error":str(e)})
@@ -685,12 +729,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200,{"ok":True},{"Set-Cookie":"ops_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
             if path == "/api/devices":
                 if not self.require_permission(sess,"manage_devices"): return
-                name=text(data,"name",120); host=text(data,"host",253); port=integer(data,"port",1,65535); protocol=choice(data,"protocol",("RTSP","ONVIF","RTSP + ONVIF","Vendor connector")); device_kind=choice(data,"device_kind",("DVR","NVR","Camera","Unknown")); vendor=text(data,"vendor_model",160,required=False); stream=text(data,"stream_label",160,required=False); coverage=choice(data,"coverage_role",("General","Entrance","Exit")); source_mode=choice(data,"source_mode",("Recorder","Standalone camera")); purposes=data.get("monitoring_purposes",[])
+                name=text(data,"name",120); host=text(data,"host",253); port=integer(data,"port",1,65535); protocol=choice(data,"protocol",("RTSP","ONVIF","RTSP + ONVIF","Vendor connector")); device_kind=choice(data,"device_kind",("DVR","NVR","Camera","Unknown")); vendor=text(data,"vendor_model",160,required=False); stream=text(data,"stream_label",160,required=False); coverage=choice(data,"coverage_role",("General","Entrance","Exit")); source_mode=choice(data,"source_mode",("Recorder","Standalone camera")); stream_url=text(data,"stream_url",500,required=False); purposes=data.get("monitoring_purposes",[])
                 allowed_purposes=("Entrance monitoring","Exit monitoring","Staff access","Gaming floor safety","Cash handling area","Incident review","Equipment area")
                 if not isinstance(purposes,list) or any(p not in allowed_purposes for p in purposes):return self.send_json(400,{"error":"Choose valid monitoring purposes"})
                 purposes_json=json.dumps(sorted(set(purposes)),separators=(",",":"))
                 if not name or not host: return self.send_json(400,{"error":"Name and IP address or hostname are required"})
-                now=utcnow(); cur=con.execute("INSERT INTO devices(project_id,name,device_kind,vendor_model,host,port,protocol,stream_label,coverage_role,source_mode,monitoring_purposes,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'Unverified',?,?)",(project_id,name,device_kind,vendor,host,port,protocol,stream,coverage,source_mode,purposes_json,now,now)); record_audit(con,actor,"created","device",cur.lastrowid,"Source registered; connection not verified",project_id); queue_automation_event(con,project_id,"device.created","device",cur.lastrowid,"unverified"); con.commit()
+                now=utcnow(); cur=con.execute("INSERT INTO devices(project_id,name,device_kind,vendor_model,host,port,protocol,stream_label,coverage_role,source_mode,monitoring_purposes,stream_url,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Unverified',?,?)",(project_id,name,device_kind,vendor,host,port,protocol,stream,coverage,source_mode,purposes_json,stream_url,now,now)); record_audit(con,actor,"created","device",cur.lastrowid,"Source registered; stream stored on server only" if stream_url else "Source registered; connection not verified",project_id); queue_automation_event(con,project_id,"device.created","device",cur.lastrowid,"unverified"); con.commit()
                 return self.send_json(201,{"id":cur.lastrowid,"status":"Unverified"})
             if path == "/api/people":
                 if not self.require_permission(sess,"manage_people"): return
@@ -793,6 +837,51 @@ class Handler(BaseHTTPRequestHandler):
             con.rollback();return self.send_json(409,{"error":"Import could not be committed because a record conflicts with current project data. No rows were imported."})
         return self.send_json(201,{"imported":len(prepared),"status":"Pending review","message":f"Imported {len(prepared):,} records. Every record is Pending review."})
 
+    def scan_device(self, con: sqlite3.Connection, sess: sqlite3.Row, device_id: int) -> None:
+        if not self.require_permission(sess,"view_movement"): return
+        project_id=selected_project(self,con)
+        if not project_id:return self.send_json(400,{"error":"Select a valid CCTV project"})
+        device=con.execute("SELECT id,name,coverage_role,stream_url FROM devices WHERE id=? AND project_id=?",(device_id,project_id)).fetchone()
+        if not device:return self.send_json(404,{"error":"Camera source not found"})
+        mime=self.headers.get("Content-Type","").split(";",1)[0].strip().lower()
+        try:
+            if mime in ("image/jpeg","image/jpg","image/pjpeg","image/png","application/octet-stream",""):
+                size=int(self.headers.get("Content-Length","0") or 0)
+                if size<1 or size>8*1024*1024:return self.send_json(413,{"error":"Upload a JPEG or PNG between 1 byte and 8 MB"})
+                body=self.rfile.read(size)
+                if not (body.startswith(b"\xff\xd8\xff") or body.startswith(b"\x89PNG\r\n\x1a\n")):
+                    return self.send_json(415,{"error":"Upload a JPEG or PNG photo. The Mac camera is a separate button."})
+                frame=decode_image(body)
+                source="uploaded photo"
+            else:
+                stream_url=(device["stream_url"] or "").strip()
+                if not stream_url:return self.send_json(400,{"error":"Save an RTSP stream URL on this DVR or camera, or upload one JPEG frame to test a match"})
+                import cv2
+                capture=cv2.VideoCapture(stream_url)
+                ok, frame=capture.read()
+                capture.release()
+                if not ok or frame is None:return self.send_json(502,{"error":"Could not read a frame from that stream"})
+                source="live stream"
+            enrolled=[]
+            for row in con.execute("SELECT id,display_name,category,photo_blob FROM people WHERE project_id=? AND status='Active' AND photo_blob IS NOT NULL",(project_id,)):
+                try: feature=feature_for_image(decode_image(row["photo_blob"]))
+                except ValueError: feature=None
+                if feature is None: continue
+                enrolled.append((row["id"], row["display_name"], row["category"], feature))
+            if not enrolled:return self.send_json(400,{"error":"No enrolled photo is ready to match. Add a JPEG or PNG on a staff, manager, or watchlist record."})
+            found=match_frame(frame, enrolled)
+        except ValueError as error:
+            return self.send_json(400,{"error":str(error)})
+        except Exception:
+            return self.send_json(502,{"error":"Face match could not run. Confirm the camera stream is reachable from this computer."})
+        if not found:
+            record_audit(con,sess["username"],"scanned","device",device_id,f"no match; source={source}",project_id); con.commit()
+            return self.send_json(200,{"matched":False,"source":source,"message":"A frame was read. No enrolled staff, manager, or watchlist face was recognized."})
+        saved=record_sighting(con,project_id,device["name"],device["coverage_role"],found,sess["username"])
+        con.commit()
+        status=200 if saved["continued"] else 201
+        return self.send_json(status,{**saved,"source":source})
+
     def first_run_setup(self, con: sqlite3.Connection) -> None:
         # First account can only be created while the server is loopback-bound,
         # from a loopback client, and with a same-origin browser request.
@@ -873,6 +962,52 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,TypeError) as e:return self.send_json(400,{"error":str(e)})
         finally:con.close()
 
+    def do_DELETE(self) -> None:
+        path=urlparse(self.path).path
+        con=db()
+        try:
+            sess=self.session(con)
+            if not sess: return self.send_json(401,{"error":"Sign in required"})
+            if not self.require_csrf(sess): return self.send_json(403,{"error":"Request verification failed"})
+            parts=path.strip("/").split("/")
+            if parts==["api","records"]:
+                if not self.require_permission(sess,"manage_users"): return
+                project_id=selected_project(self,con)
+                if not project_id: return self.send_json(400,{"error":"Select a valid CCTV project"})
+                kind=(parse_qs(urlparse(self.path).query).get("kind") or [""])[0]
+                movements=alerts=people=0
+                if kind=="staff":
+                    movements=con.execute("DELETE FROM movement_events WHERE project_id=? AND (person_label LIKE '%· Staff' OR person_label LIKE '%· Manager')",(project_id,)).rowcount
+                elif kind=="whitelist":
+                    movements=con.execute("DELETE FROM movement_events WHERE project_id=? AND person_label LIKE '%· Watchlist'",(project_id,)).rowcount
+                    alerts=con.execute("DELETE FROM alerts WHERE project_id=? AND summary LIKE 'Watchlist face matched%'",(project_id,)).rowcount
+                elif kind=="people":
+                    con.execute("DELETE FROM presence_events WHERE project_id=?",(project_id,))
+                    con.execute("UPDATE movement_events SET person_id=NULL WHERE project_id=?",(project_id,))
+                    people=con.execute("DELETE FROM people WHERE project_id=?",(project_id,)).rowcount
+                else:
+                    return self.send_json(400,{"error":"Choose staff, whitelist, or people"})
+                record_audit(con,sess["username"],"deleted","records",project_id,f"Administrator deleted {kind}: {movements} sightings, {alerts} alerts, {people} people",project_id)
+                con.commit()
+                return self.send_json(200,{"ok":True,"kind":kind,"movements":movements,"alerts":alerts,"people":people})
+            if len(parts)!=3 or parts[0]!="api" or parts[1]!="people" or not parts[2].isdigit():
+                return self.send_json(404,{"error":"Not found"})
+            if not self.require_permission(sess,"manage_users"): return
+            project_id=selected_project(self,con)
+            if not project_id: return self.send_json(400,{"error":"Select a valid CCTV project"})
+            ident=int(parts[2])
+            row=con.execute("SELECT id FROM people WHERE id=? AND project_id=?",(ident,project_id)).fetchone()
+            if not row: return self.send_json(404,{"error":"Person record not found"})
+            con.execute("DELETE FROM presence_events WHERE person_id=? AND project_id=?",(ident,project_id))
+            con.execute("UPDATE movement_events SET person_id=NULL WHERE person_id=? AND project_id=?",(ident,project_id))
+            con.execute("DELETE FROM people WHERE id=? AND project_id=?",(ident,project_id))
+            record_audit(con,sess["username"],"deleted","person",ident,"People record and stored photo removed",project_id)
+            queue_automation_event(con,project_id,"person.deleted","person",ident,"deleted")
+            con.commit()
+            return self.send_json(200,{"ok":True})
+        finally:
+            con.close()
+
     def login(self, con: sqlite3.Connection) -> None:
         try: data=self.read_json()
         except ValueError as e:return self.send_json(400,{"error":str(e)})
@@ -912,6 +1047,40 @@ def choice(obj: dict,key: str,allowed: tuple[str,...]) -> str:
     if value not in allowed: raise ValueError(f"Invalid {key}")
     return value
 
+def watch_streams() -> None:
+    import time as time_mod
+    seen: dict[tuple[int,int], float] = {}
+    while True:
+        time_mod.sleep(8)
+        con=db()
+        try:
+            devices=con.execute("SELECT id,project_id,name,coverage_role,stream_url FROM devices WHERE stream_url!=''").fetchall()
+            for device in devices:
+                stream_url=(device["stream_url"] or "").strip()
+                if not stream_url: continue
+                try:
+                    import cv2
+                    capture=cv2.VideoCapture(stream_url)
+                    ok, frame=capture.read(); capture.release()
+                    if not ok or frame is None: continue
+                    enrolled=[]
+                    for row in con.execute("SELECT id,display_name,category,photo_blob FROM people WHERE project_id=? AND status='Active' AND photo_blob IS NOT NULL",(device["project_id"],)):
+                        try: feature=feature_for_image(decode_image(row["photo_blob"]))
+                        except ValueError: feature=None
+                        if feature is None: continue
+                        enrolled.append((row["id"], row["display_name"], row["category"], feature))
+                    found=match_frame(frame, enrolled) if enrolled else None
+                except Exception:
+                    continue
+                if not found: continue
+                key=(device["id"], found["person_id"])
+                if time_mod.time()-seen.get(key,0)<30: continue
+                seen[key]=time_mod.time()
+                record_sighting(con,device["project_id"],device["name"],device["coverage_role"],found,"camera-watch")
+                con.commit()
+        finally:
+            con.close()
+
 def main() -> None:
     parser=argparse.ArgumentParser(); parser.add_argument("command",choices=("serve","init-admin"),nargs="?",default="serve"); args=parser.parse_args()
     db().close()
@@ -919,6 +1088,8 @@ def main() -> None:
     if HOST not in ("127.0.0.1","localhost","::1"):
         raise SystemExit("This starter is loopback-only. Do not expose it to a network; production deployment requires TLS and an approved access-control layer.")
     print(f"Casino Ops local console listening at http://{HOST}:{PORT} (this device only)")
+    import threading
+    threading.Thread(target=watch_streams, name="camera-watch", daemon=True).start()
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
 
 if __name__=="__main__": main()
