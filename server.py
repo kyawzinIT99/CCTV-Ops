@@ -8,9 +8,11 @@ import hmac
 import http.cookies
 import json
 import os
+import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 import socket
@@ -35,6 +37,7 @@ DB_PATH = Path(os.environ.get("CASINO_OPS_DB", ROOT / "data" / "casino-ops.sqlit
 HOST = os.environ.get("CASINO_OPS_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CASINO_OPS_PORT", "8080"))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+OWNER_ALERT_EMAIL = os.environ.get("CASINO_OPS_OWNER_EMAIL", "itsolutions.mm@gmail.com").strip().lower()
 SESSION_SECONDS = 8 * 60 * 60
 PBKDF2_ROUNDS = 600_000
 RATE_LIMIT: dict[str, list[float]] = {}
@@ -56,6 +59,9 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash BLOB NOT NULL,
   permissions TEXT NOT NULL DEFAULT '[]',
   active INTEGER NOT NULL DEFAULT 1,
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  alert_channel TEXT NOT NULL DEFAULT 'none',
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -155,7 +161,8 @@ CREATE TABLE IF NOT EXISTS automation_outbox (
   delivery_status TEXT NOT NULL DEFAULT 'Queued' CHECK(delivery_status IN ('Queued','Delivered','Failed')),
   created_at TEXT NOT NULL,
   delivered_at TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_automation_project_queue ON automation_outbox(project_id,delivery_status,created_at DESC);
 CREATE TABLE IF NOT EXISTS project_discovery (
@@ -165,7 +172,15 @@ CREATE TABLE IF NOT EXISTS project_discovery (
   last_scan REAL,
   last_result TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
+N8N_ALERT_EVENTS = frozenset(("alert.created", "user.created"))
+N8N_WAKE = threading.Event()
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^\+?[0-9][0-9 .\-]{6,38}$")
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -241,6 +256,11 @@ def db() -> sqlite3.Connection:
     user_cols={row[1] for row in con.execute("PRAGMA table_info(users)")}
     if "permissions" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
     if "active" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    if "email" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+    if "phone" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+    if "alert_channel" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN alert_channel TEXT NOT NULL DEFAULT 'none'")
+    outbox_cols={row[1] for row in con.execute("PRAGMA table_info(automation_outbox)")}
+    if "last_error" not in outbox_cols: con.execute("ALTER TABLE automation_outbox ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
     full_access=json.dumps(list(PERMISSIONS),separators=(",",":"))
     con.execute("UPDATE users SET permissions=? WHERE id=(SELECT MIN(id) FROM users) AND permissions='[]'",(full_access,))
     con.execute("CREATE INDEX IF NOT EXISTS idx_devices_project ON devices(project_id,created_at DESC)")
@@ -284,10 +304,175 @@ def record_audit(con: sqlite3.Connection, actor: str, action: str, object_type: 
     con.execute("INSERT INTO audit_log(project_id,actor,action,object_type,object_id,detail,created_at) VALUES(?,?,?,?,?,?,?)", (project_id,actor,action,object_type,object_id,detail[:500],utcnow()))
 
 def queue_automation_event(con: sqlite3.Connection, project_id: int, event_type: str, object_type: str, object_id: int | None, status: str = "") -> None:
-    # Outbox payload intentionally excludes names, IDs, photos, biometric data, and footage.
+    # Outbox payload excludes names, photos, video, face data, and government identifiers.
     event_id=str(uuid.uuid4()); created=utcnow()
     payload={"event_id":event_id,"event_type":event_type,"event_version":1,"occurred_at":created,"project_id":project_id,"object_type":object_type,"object_id":object_id,"status":status}
     con.execute("INSERT INTO automation_outbox(id,project_id,event_type,payload,delivery_status,created_at) VALUES(?,?,?,?,'Queued',?)",(event_id,project_id,event_type,json.dumps(payload,separators=(",",":")),created))
+    if event_type in N8N_ALERT_EVENTS:
+        N8N_WAKE.set()
+
+def setting(con: sqlite3.Connection, key: str) -> str:
+    row=con.execute("SELECT value FROM app_settings WHERE key=?",(key,)).fetchone()
+    return (row["value"] if row else "") or ""
+
+def n8n_webhook_config(con: sqlite3.Connection) -> tuple[str,str,str]:
+    env_url=os.environ.get("N8N_WEBHOOK_URL","").strip()
+    env_secret=os.environ.get("N8N_WEBHOOK_SECRET","").strip()
+    stored_url=setting(con,"n8n_webhook_url").strip()
+    stored_secret=setting(con,"n8n_webhook_secret").strip()
+    url=env_url or stored_url
+    secret=env_secret or stored_secret
+    source="environment" if env_url else ("saved" if stored_url else "")
+    return url, secret, source
+
+def validate_webhook_url(url: str) -> str:
+    value=url.strip()
+    if not value:
+        return ""
+    parsed=urlparse(value)
+    if parsed.scheme not in ("https","http") or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Enter an https webhook URL from the n8n workflow")
+    if parsed.scheme=="http":
+        try:
+            if not ipaddress.ip_address(parsed.hostname or "").is_loopback:
+                raise ValueError("Use https for the Hostinger n8n webhook")
+        except ValueError as error:
+            if "https" in str(error):
+                raise
+            raise ValueError("Use https for the Hostinger n8n webhook")
+    return value
+
+def account_contacts(data: dict) -> tuple[str,str,str]:
+    channel=(text(data,"alert_channel",12,required=False) or "none").lower()
+    if channel not in ("none","email","sms","both"):
+        raise ValueError("Choose none, email, sms, or both")
+    email=text(data,"email",120,required=False).lower()
+    phone=text(data,"phone",40,required=False)
+    if email and not EMAIL_RE.match(email):
+        raise ValueError("Enter a valid email address")
+    if phone and not PHONE_RE.match(phone):
+        raise ValueError("Enter a valid phone number for SMS")
+    if channel in ("email","both") and not email:
+        raise ValueError("Email is required for mail alerts")
+    if channel in ("sms","both") and not phone:
+        raise ValueError("Phone is required for SMS alerts")
+    return email, phone, channel
+
+def account_alert_recipients(con: sqlite3.Connection, user_id: int | None=None) -> list[dict[str,str]]:
+    if user_id:
+        rows=con.execute("SELECT email,phone,alert_channel FROM users WHERE id=? AND active=1",(user_id,)).fetchall()
+    else:
+        rows=con.execute("SELECT email,phone,alert_channel FROM users WHERE active=1 AND alert_channel!='none'").fetchall()
+    recipients=[]
+    for row in rows:
+        channel=row["alert_channel"] or "none"
+        email=(row["email"] or "").strip()
+        phone=(row["phone"] or "").strip()
+        if channel in ("email","both") and email:
+            recipients.append({"channel":"email","to":email})
+        if channel in ("sms","both") and phone:
+            recipients.append({"channel":"sms","to":phone})
+    return recipients
+
+def watchlist_alert_recipients(con: sqlite3.Connection) -> list[dict[str,str]]:
+    owner=OWNER_ALERT_EMAIL
+    return [{"channel":"email","to":owner}] if owner else []
+
+def format_site_time(value: str) -> str:
+    raw=(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        when=datetime.fromisoformat(raw.replace("Z","+00:00"))
+    except ValueError:
+        return raw
+    if when.tzinfo is None:
+        when=when.replace(tzinfo=timezone.utc)
+    return when.astimezone().strftime("%d %b %Y, %H:%M")
+
+def watchlist_mail_body(source: str, occurred_at: str) -> str:
+    camera=(source or "").strip() or "site camera"
+    when=format_site_time(occurred_at)
+    lines=["Watchlist match","","Camera: "+camera]
+    if when:
+        lines.append("Time: "+when)
+    lines.extend(["","Open Casino Ops on the site computer to review."])
+    return "\n".join(lines)
+
+def n8n_message_for(con: sqlite3.Connection, payload: dict) -> dict:
+    event_type=payload.get("event_type")
+    if event_type=="alert.created":
+        source=""
+        object_id=payload.get("object_id")
+        if object_id:
+            row=con.execute("SELECT source FROM alerts WHERE id=?",(object_id,)).fetchone()
+            source=(row["source"] if row else "") or ""
+        title="Watchlist match needs review"
+        message=watchlist_mail_body(source,str(payload.get("occurred_at") or ""))
+        return {"title":title,"message":message,"source":source,"channels":sorted({item["channel"] for item in payload.get("recipients") or []})}
+    if event_type=="user.created":
+        return {"title":"Casino Ops account is ready","message":"A sign-in account was created for Casino Ops. Open the site computer to sign in.","source":"","channels":sorted({item["channel"] for item in payload.get("recipients") or []})}
+    return {"title":"Casino Ops notice","message":"A queued site event is ready. Open Casino Ops on the site computer.","source":"","channels":sorted({item["channel"] for item in payload.get("recipients") or []})}
+
+def post_n8n_webhook(url: str, secret: str, payload: dict) -> None:
+    body=json.dumps(payload,separators=(",",":")).encode()
+    request=urllib.request.Request(url,data=body,method="POST")
+    request.add_header("Content-Type","application/json")
+    if secret:
+        request.add_header("X-N8N-Secret",secret)
+        request.add_header("Authorization",f"Bearer {secret}")
+    try:
+        with urllib.request.urlopen(request,timeout=12) as response:
+            if not 200<=int(getattr(response,"status",200))<300:
+                raise RuntimeError(f"n8n returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"n8n returned HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError("n8n could not be reached from this computer") from error
+
+def flush_n8n_outbox(limit: int=20) -> dict:
+    con=db()
+    sent=failed=skipped=0
+    try:
+        url,secret,_source=n8n_webhook_config(con)
+        if not url:
+            return {"sent":0,"failed":0,"skipped":0,"configured":False}
+        rows=con.execute("SELECT id,project_id,event_type,payload,attempts FROM automation_outbox WHERE delivery_status='Queued' AND event_type='alert.created' ORDER BY created_at LIMIT ?",(limit,)).fetchall()
+        for row in rows:
+            try:
+                payload=json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                payload={}
+            if not isinstance(payload,dict):
+                payload={}
+            recipients=watchlist_alert_recipients(con)
+            if not recipients:
+                skipped+=1
+                continue
+            payload["recipients"]=recipients
+            payload.update(n8n_message_for(con,payload))
+            attempts=int(row["attempts"] or 0)+1
+            try:
+                post_n8n_webhook(url,secret,payload)
+                con.execute("UPDATE automation_outbox SET delivery_status='Delivered',delivered_at=?,attempts=?,last_error='' WHERE id=?",(utcnow(),attempts,row["id"]))
+                sent+=1
+            except Exception as error:
+                status="Failed" if attempts>=5 else "Queued"
+                con.execute("UPDATE automation_outbox SET delivery_status=?,attempts=?,last_error=? WHERE id=?",(status,attempts,str(error)[:200],row["id"]))
+                failed+=1
+        con.commit()
+        return {"sent":sent,"failed":failed,"skipped":skipped,"configured":True}
+    finally:
+        con.close()
+
+def dispatch_n8n_loop() -> None:
+    while True:
+        N8N_WAKE.wait(timeout=12)
+        N8N_WAKE.clear()
+        try:
+            flush_n8n_outbox()
+        except Exception:
+            pass
 
 RFC1918=(ipaddress.ip_network("10.0.0.0/8"),ipaddress.ip_network("172.16.0.0/12"),ipaddress.ip_network("192.168.0.0/16"))
 def validate_discovery_networks(value: object) -> list[str]:
@@ -501,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200,[dict(r) for r in con.execute("SELECT * FROM projects ORDER BY name COLLATE NOCASE").fetchall()])
             if path == "/api/users":
                 if not self.require_permission(sess,"manage_users"): return
-                rows=con.execute("SELECT id,username,permissions,active,created_at FROM users ORDER BY username COLLATE NOCASE").fetchall()
+                rows=con.execute("SELECT id,username,email,phone,alert_channel,permissions,active,created_at FROM users ORDER BY username COLLATE NOCASE").fetchall()
                 return self.send_json(200,[{**dict(r),"permissions":json.loads(r["permissions"]),"is_current_user":r["username"]==sess["username"]} for r in rows])
             if path in ("/api/backups","/api/backups/download"):
                 if not self.require_permission(sess,"manage_backups"): return
@@ -546,8 +731,25 @@ class Handler(BaseHTTPRequestHandler):
                 return xlsx_response(self,"people-export.xlsx",people_workbook(rows,include_data=True))
             if path == "/api/automation/outbox":
                 if not self.require_permission(sess,"view_automation"): return
-                rows=con.execute("SELECT id,event_type,payload,delivery_status,created_at,delivered_at,attempts FROM automation_outbox WHERE project_id=? ORDER BY created_at DESC LIMIT 200",(project_id,)).fetchall()
+                rows=con.execute("SELECT id,event_type,payload,delivery_status,created_at,delivered_at,attempts,last_error FROM automation_outbox WHERE project_id=? ORDER BY created_at DESC LIMIT 200",(project_id,)).fetchall()
                 return self.send_json(200,[dict(r) for r in rows])
+            if path == "/api/automation/settings":
+                if not self.require_permission(sess,"view_automation"): return
+                url,secret,source=n8n_webhook_config(con)
+                parsed=urlparse(url) if url else None
+                return self.send_json(200,{
+                    "configured":bool(url),
+                    "has_secret":bool(secret),
+                    "source":source,
+                    "webhook_host":parsed.netloc if parsed else "",
+                    "webhook_url":url if source=="saved" else "",
+                    "locked":source=="environment",
+                    "workflow_url":"https://n8n-al8a.srv1707349.hstgr.cloud/workflow/j70YsXP8XqALcGSm",
+                    "owner_email":OWNER_ALERT_EMAIL,
+                    "mail_installed":True,
+                    "sms_installed":False,
+                    "opted_in":0
+                })
             if path == "/api/discovery/settings":
                 if not self.require_permission(sess,"run_discovery"): return
                 row=con.execute("SELECT enabled,cidrs,last_scan,last_result FROM project_discovery WHERE project_id=?",(project_id,)).fetchone()
@@ -671,12 +873,67 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.require_permission(sess,"manage_users"): return
                 username=text(data,"username",80); password=text(data,"password",200); permissions=valid_permissions(data.get("permissions"))
                 if len(password)<14:return self.send_json(400,{"error":"Use a unique password with at least 14 characters"})
+                email,phone,alert_channel=account_contacts(data)
                 salt=secrets.token_bytes(16); digest=hashlib.pbkdf2_hmac("sha256",password.encode(),salt,PBKDF2_ROUNDS)
-                cur=con.execute("INSERT INTO users(username,password_salt,password_hash,permissions,active,created_at) VALUES(?,?,?,?,1,?)",(username,salt,digest,json.dumps(permissions,separators=(",",":")),utcnow()))
+                cur=con.execute("INSERT INTO users(username,password_salt,password_hash,permissions,active,email,phone,alert_channel,created_at) VALUES(?,?,?,?,1,?,?,?,?)",(username,salt,digest,json.dumps(permissions,separators=(",",":")),email,phone,alert_channel,utcnow()))
                 record_audit(con,actor,"created","user",cur.lastrowid,"Account created with individually selected permissions")
                 project_for_event=selected_project(self,con) or con.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()[0]
                 queue_automation_event(con,project_for_event,"user.created","user",cur.lastrowid,"created")
-                con.commit();return self.send_json(201,{"id":cur.lastrowid,"username":username,"permissions":permissions,"active":True})
+                con.commit();N8N_WAKE.set()
+                return self.send_json(201,{"id":cur.lastrowid,"username":username,"email":email,"phone":phone,"alert_channel":alert_channel,"permissions":permissions,"active":True})
+            if path == "/api/automation/settings":
+                if not self.require_permission(sess,"manage_users"): return
+                env_url=os.environ.get("N8N_WEBHOOK_URL","").strip()
+                if env_url:return self.send_json(409,{"error":"The webhook URL is set in the server environment. Restart the app to change it."})
+                webhook_url=validate_webhook_url(text(data,"webhook_url",300,required=False))
+                webhook_secret=text(data,"webhook_secret",200,required=False)
+                con.execute("INSERT INTO app_settings(key,value) VALUES('n8n_webhook_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(webhook_url,))
+                if webhook_secret:
+                    con.execute("INSERT INTO app_settings(key,value) VALUES('n8n_webhook_secret',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(webhook_secret,))
+                elif not webhook_url:
+                    con.execute("DELETE FROM app_settings WHERE key IN ('n8n_webhook_url','n8n_webhook_secret')")
+                record_audit(con,actor,"updated","automation",None,"n8n webhook saved" if webhook_url else "n8n webhook cleared")
+                con.commit();N8N_WAKE.set()
+                return self.send_json(200,{"ok":True,"configured":bool(webhook_url)})
+            if path == "/api/automation/test":
+                if not self.require_permission(sess,"manage_users"): return
+                url,secret,_source=n8n_webhook_config(con)
+                if not url:return self.send_json(409,{"error":"Save the n8n webhook URL first"})
+                recipients=watchlist_alert_recipients(con)
+                if not recipients:return self.send_json(409,{"error":"Add an optional email or SMS number on at least one account first"})
+                occurred_at=utcnow()
+                payload={"event_id":str(uuid.uuid4()),"event_type":"automation.test","event_version":1,"occurred_at":occurred_at,"project_id":selected_project(self,con) or 0,"object_type":"automation","object_id":None,"status":"test","recipients":recipients,"title":"Watchlist match needs review","message":watchlist_mail_body("site camera",occurred_at),"source":"site camera","channels":sorted({item["channel"] for item in recipients})}
+                try:
+                    post_n8n_webhook(url,secret,payload)
+                except Exception as error:
+                    return self.send_json(502,{"error":str(error)})
+                record_audit(con,actor,"tested","automation",None,"n8n test payload sent")
+                con.commit()
+                return self.send_json(200,{"ok":True,"recipients":len(recipients)})
+            if path == "/api/automation/optional":
+                if not self.require_permission(sess,"manage_users"): return
+                try:
+                    channel=(text(data,"channel",12,required=False) or "email").lower()
+                    to=text(data,"to",120).lower()
+                except ValueError as error:
+                    return self.send_json(400,{"error":str(error)})
+                if channel=="sms":
+                    return self.send_json(409,{"error":"SMS is in this menu and waits for an API key"})
+                if channel!="email":
+                    return self.send_json(400,{"error":"Choose email"})
+                if not EMAIL_RE.match(to):
+                    return self.send_json(400,{"error":"Enter a valid email address"})
+                url,secret,_source=n8n_webhook_config(con)
+                if not url:return self.send_json(409,{"error":"Save the n8n webhook URL first"})
+                occurred_at=utcnow()
+                payload={"event_id":str(uuid.uuid4()),"event_type":"automation.optional","event_version":1,"occurred_at":occurred_at,"project_id":selected_project(self,con) or 0,"object_type":"automation","object_id":None,"status":"optional","recipients":[{"channel":"email","to":to}],"title":"Casino Ops notice","message":watchlist_mail_body("Mail and SMS menu",occurred_at),"source":"Mail and SMS","channels":["email"]}
+                try:
+                    post_n8n_webhook(url,secret,payload)
+                except Exception as error:
+                    return self.send_json(502,{"error":str(error)})
+                record_audit(con,actor,"sent","automation",None,"optional mail sent from the Mail and SMS menu")
+                con.commit()
+                return self.send_json(200,{"ok":True,"message":"Optional mail sent. Watchlist mail to the owner stays automatic."})
             if path == "/api/backups":
                 if not self.require_permission(sess,"manage_backups"): return
                 project_id=selected_project(self,con) or con.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()[0]
@@ -892,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
             record_audit(con,sess["username"],"scanned","device",device_id,f"no match; source={source}",project_id); con.commit()
             return self.send_json(200,{"matched":False,"source":source,"message":"A frame was read. No enrolled staff, manager, or watchlist face was recognized."})
         saved=record_sighting(con,project_id,device["name"],device["coverage_role"],found,sess["username"])
-        con.commit()
+        con.commit();N8N_WAKE.set()
         status=200 if saved["continued"] else 201
         return self.send_json(status,{**saved,"source":source})
 
@@ -947,7 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
                 retains_admin=active and "manage_users" in permissions
                 other_admin=con.execute("SELECT 1 FROM users WHERE active=1 AND id!=? AND instr(permissions,'\"manage_users\"')>0 LIMIT 1",(ident,)).fetchone()
                 if not (retains_admin or other_admin):return self.send_json(400,{"error":"At least one active account must retain user-management permission"})
-                con.execute("UPDATE users SET permissions=?,active=? WHERE id=?",(json.dumps(permissions,separators=(",",":")),1 if active else 0,ident))
+                email,phone,alert_channel=account_contacts(data)
+                con.execute("UPDATE users SET permissions=?,active=?,email=?,phone=?,alert_channel=? WHERE id=?",(json.dumps(permissions,separators=(",",":")),1 if active else 0,email,phone,alert_channel,ident))
                 if not active:con.execute("DELETE FROM sessions WHERE user_id=?",(ident,))
                 record_audit(con,actor,"updated","user",ident,f"active={active}; permissions={','.join(permissions)}")
                 project_for_event=selected_project(self,con) or con.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()[0]
@@ -1141,6 +1399,7 @@ def watch_streams() -> None:
                 seen[key]=time_mod.time()
                 record_sighting(con,device["project_id"],device["name"],device["coverage_role"],found,"camera-watch")
                 con.commit()
+                N8N_WAKE.set()
         finally:
             con.close()
 
@@ -1151,8 +1410,8 @@ def main() -> None:
     if HOST not in ("127.0.0.1","localhost","::1"):
         raise SystemExit("This starter is loopback-only. Do not expose it to a network; production deployment requires TLS and an approved access-control layer.")
     print(f"Casino Ops local console listening at http://{HOST}:{PORT} (this device only)")
-    import threading
     threading.Thread(target=watch_streams, name="camera-watch", daemon=True).start()
+    threading.Thread(target=dispatch_n8n_loop, name="n8n-dispatch", daemon=True).start()
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
 
 if __name__=="__main__": main()

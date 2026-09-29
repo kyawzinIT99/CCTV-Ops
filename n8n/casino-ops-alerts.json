@@ -1,0 +1,118 @@
+{
+  "name": "Casino Ops — mail and SMS alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "casino-ops-alerts",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook-casino-ops",
+      "name": "Casino Ops webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "casino-ops-alerts"
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $input.first().json;\nconst body = root.body && typeof root.body === 'object' ? root.body : root;\nconst recipients = Array.isArray(body.recipients) ? body.recipients : [];\nif (!recipients.length) {\n  return [{ json: { skip: true, title: body.title || 'Casino Ops notice', message: body.message || '' } }];\n}\nreturn recipients.map((item) => ({\n  json: {\n    skip: false,\n    channel: item.channel,\n    to: item.to,\n    title: body.title || 'Casino Ops notice',\n    message: body.message || '',\n    event_type: body.event_type || '',\n    occurred_at: body.occurred_at || '',\n    source: body.source || ''\n  }\n}));"
+      },
+      "id": "split-recipients",
+      "name": "Split mail and SMS contacts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "is-email",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "email",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "if-email",
+      "name": "Email channel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 180]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "is-sms",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "sms",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "if-sms",
+      "name": "SMS channel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 420]
+    },
+    {
+      "parameters": {
+        "fromEmail": "alerts@example.com",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.title }}",
+        "text": "={{ $json.message }}"
+      },
+      "id": "send-email",
+      "name": "Send email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [960, 120],
+      "notes": "Attach the Hostinger SMTP or Gmail credential here."
+    },
+    {
+      "parameters": {
+        "from": "+10000000000",
+        "to": "={{ $json.to }}",
+        "message": "={{ $json.title }}: {{ $json.message }}"
+      },
+      "id": "send-sms",
+      "name": "Send SMS",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [960, 420],
+      "notes": "Attach the Twilio credential here, or replace this node with the SMS provider already on the Hostinger workflow."
+    }
+  ],
+  "connections": {
+    "Casino Ops webhook": {
+      "main": [[{ "node": "Split mail and SMS contacts", "type": "main", "index": 0 }]]
+    },
+    "Split mail and SMS contacts": {
+      "main": [
+        [
+          { "node": "Email channel?", "type": "main", "index": 0 },
+          { "node": "SMS channel?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Email channel?": {
+      "main": [[{ "node": "Send email", "type": "main", "index": 0 }]]
+    },
+    "SMS channel?": {
+      "main": [[{ "node": "Send SMS", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": true,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "description": "Delivers Casino Ops watchlist and account notices to optional email or SMS contacts. Does not receive names, photos, passport, or address." }
+}
