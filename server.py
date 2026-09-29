@@ -194,11 +194,14 @@ def record_sighting(con: sqlite3.Connection, project_id: int, device_name: str, 
         movement_id=cur.lastrowid
         if found["category"]=="Watchlist":
             summary=f"Watchlist face matched on {device_name} at {now}. Review before any message is sent."
-            alert=con.execute("INSERT INTO alerts(project_id,source,occurred_at,summary,status,created_at,updated_at) VALUES(?,?,?,?,'Needs review',?,?)",(project_id,device_name,now,summary,now,now))
+            alert=con.execute("INSERT INTO alerts(project_id,source,occurred_at,summary,status,created_at,updated_at,person_id) VALUES(?,?,?,?,'Needs review',?,?,?)",(project_id,device_name,now,summary,now,now,found["person_id"]))
             queue_automation_event(con,project_id,"alert.created","alert",alert.lastrowid,"needs_review")
         record_audit(con,actor,"matched","movement",movement_id,f"person_id={found['person_id']}; category={found['category']}; direction={direction}",project_id)
         queue_automation_event(con,project_id,"movement.matched","movement",movement_id,direction.lower())
-    return {"matched":True,"continued":continued,"person":found["name"],"category":found["category"],"direction":direction,"score":round(found["score"],3),"seen_at":now,"camera":device_name,"review_alert":found["category"]=="Watchlist" and not continued}
+    profile=con.execute("SELECT phone,passport,address,residence FROM people WHERE id=? AND project_id=?",(found["person_id"],project_id)).fetchone()
+    details={"phone":"","passport":"","address":"","residence":""}
+    if profile: details={key:(profile[key] or "") for key in details}
+    return {"matched":True,"continued":continued,"person":found["name"],"category":found["category"],"direction":direction,"score":round(found["score"],3),"seen_at":now,"camera":device_name,"review_alert":found["category"]=="Watchlist" and not continued,**details}
 
 def db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -223,11 +226,18 @@ def db() -> sqlite3.Connection:
     if "position" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN position TEXT NOT NULL DEFAULT ''")
     if "photo_blob" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN photo_blob BLOB")
     if "photo_mime" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN photo_mime TEXT NOT NULL DEFAULT ''")
+    if "phone" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+    if "passport" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN passport TEXT NOT NULL DEFAULT ''")
+    if "address" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN address TEXT NOT NULL DEFAULT ''")
+    if "residence" not in people_cols:con.execute("ALTER TABLE people ADD COLUMN residence TEXT NOT NULL DEFAULT ''")
+    alert_cols={row[1] for row in con.execute("PRAGMA table_info(alerts)")}
+    if "person_id" not in alert_cols:con.execute("ALTER TABLE alerts ADD COLUMN person_id INTEGER")
     movement_cols={row[1] for row in con.execute("PRAGMA table_info(movement_events)")}
     if "direction" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN direction TEXT NOT NULL DEFAULT 'Unknown'")
     if "person_id" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN person_id INTEGER")
     if "person_label" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN person_label TEXT NOT NULL DEFAULT ''")
     if "match_score" not in movement_cols:con.execute("ALTER TABLE movement_events ADD COLUMN match_score REAL")
+    con.execute("UPDATE alerts SET person_id=(SELECT m.person_id FROM movement_events m WHERE m.project_id=alerts.project_id AND m.person_label LIKE '%· Watchlist' AND m.first_seen=alerts.occurred_at LIMIT 1) WHERE person_id IS NULL AND summary LIKE 'Watchlist face matched%'")
     user_cols={row[1] for row in con.execute("PRAGMA table_info(users)")}
     if "permissions" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
     if "active" not in user_cols: con.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -546,7 +556,9 @@ class Handler(BaseHTTPRequestHandler):
             if table:
                 if not self.require_permission(sess,table[2]): return
                 if table[0]=="audit_log":rows=con.execute("SELECT * FROM audit_log WHERE project_id=? OR project_id IS NULL ORDER BY created_at DESC LIMIT 500",(project_id,)).fetchall()
-                elif table[0]=="people":rows=con.execute("SELECT p.id,p.project_id,p.display_name,p.category,p.position,p.record_reference,p.record_owner,p.purpose,p.review_date,p.status,p.photo_mime,p.created_at,p.updated_at,(SELECT e.status FROM presence_events e WHERE e.person_id=p.id AND e.project_id=p.project_id ORDER BY e.occurred_at DESC LIMIT 1) AS presence_status,(SELECT e.occurred_at FROM presence_events e WHERE e.person_id=p.id AND e.project_id=p.project_id ORDER BY e.occurred_at DESC LIMIT 1) AS presence_at FROM people p WHERE p.project_id=? ORDER BY p.created_at DESC LIMIT 500",(project_id,)).fetchall()
+                elif table[0]=="people":rows=con.execute("SELECT p.id,p.project_id,p.display_name,p.category,p.position,p.phone,p.passport,p.address,p.residence,p.record_reference,p.record_owner,p.purpose,p.review_date,p.status,p.photo_mime,p.created_at,p.updated_at,(SELECT e.status FROM presence_events e WHERE e.person_id=p.id AND e.project_id=p.project_id ORDER BY e.occurred_at DESC LIMIT 1) AS presence_status,(SELECT e.occurred_at FROM presence_events e WHERE e.person_id=p.id AND e.project_id=p.project_id ORDER BY e.occurred_at DESC LIMIT 1) AS presence_at FROM people p WHERE p.project_id=? ORDER BY p.created_at DESC LIMIT 500",(project_id,)).fetchall()
+                elif table[0]=="movement_events":rows=con.execute("SELECT m.*,p.phone,p.passport,p.address,p.residence FROM movement_events m LEFT JOIN people p ON p.id=m.person_id AND p.project_id=m.project_id WHERE m.project_id=? ORDER BY m.last_seen DESC LIMIT 500",(project_id,)).fetchall()
+                elif table[0]=="alerts":rows=con.execute("SELECT a.*,p.phone,p.passport,p.address,p.residence,p.display_name AS person_name FROM alerts a LEFT JOIN people p ON p.id=a.person_id AND p.project_id=a.project_id WHERE a.project_id=? ORDER BY a.occurred_at DESC LIMIT 500",(project_id,)).fetchall()
                 else:rows=con.execute(f"SELECT * FROM {table[0]} WHERE project_id=? ORDER BY {table[1]} LIMIT 500",(project_id,)).fetchall()
                 if table[0]=="devices":
                     result=[]
@@ -729,20 +741,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200,{"ok":True},{"Set-Cookie":"ops_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
             if path == "/api/devices":
                 if not self.require_permission(sess,"manage_devices"): return
-                name=text(data,"name",120); host=text(data,"host",253); port=integer(data,"port",1,65535); protocol=choice(data,"protocol",("RTSP","ONVIF","RTSP + ONVIF","Vendor connector")); device_kind=choice(data,"device_kind",("DVR","NVR","Camera","Unknown")); vendor=text(data,"vendor_model",160,required=False); stream=text(data,"stream_label",160,required=False); coverage=choice(data,"coverage_role",("General","Entrance","Exit")); source_mode=choice(data,"source_mode",("Recorder","Standalone camera")); stream_url=text(data,"stream_url",500,required=False); purposes=data.get("monitoring_purposes",[])
+                name=text(data,"name",120); host=text(data,"host",253); port=integer(data,"port",1,65535); protocol=choice(data,"protocol",("RTSP","ONVIF","RTSP + ONVIF","Vendor connector")); device_kind=choice(data,"device_kind",("DVR","NVR","Camera","Unknown")); vendor=text(data,"vendor_model",160,required=False); stream=text(data,"stream_label",160,required=False); coverage=choice(data,"coverage_role",("General","Entrance","Exit")); source_mode=choice(data,"source_mode",("Recorder","Standalone camera")); model=text(data,"camera_model",40,required=False) or "Other RTSP"; secret=text(data,"camera_secret",64,required=False) or text(data,"verification_code",64,required=False); channel_raw=data.get("channel",""); channel=integer(data,"channel",1,64) if str(channel_raw).strip() else 1; stream_url=camera_stream_url(model, host, port, text(data,"camera_user",64,required=False), secret, channel, text(data,"stream_url",500,required=False)); purposes=data.get("monitoring_purposes",[])
                 allowed_purposes=("Entrance monitoring","Exit monitoring","Staff access","Gaming floor safety","Cash handling area","Incident review","Equipment area")
                 if not isinstance(purposes,list) or any(p not in allowed_purposes for p in purposes):return self.send_json(400,{"error":"Choose valid monitoring purposes"})
                 purposes_json=json.dumps(sorted(set(purposes)),separators=(",",":"))
                 if not name or not host: return self.send_json(400,{"error":"Name and IP address or hostname are required"})
-                now=utcnow(); cur=con.execute("INSERT INTO devices(project_id,name,device_kind,vendor_model,host,port,protocol,stream_label,coverage_role,source_mode,monitoring_purposes,stream_url,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Unverified',?,?)",(project_id,name,device_kind,vendor,host,port,protocol,stream,coverage,source_mode,purposes_json,stream_url,now,now)); record_audit(con,actor,"created","device",cur.lastrowid,"Source registered; stream stored on server only" if stream_url else "Source registered; connection not verified",project_id); queue_automation_event(con,project_id,"device.created","device",cur.lastrowid,"unverified"); con.commit()
-                return self.send_json(201,{"id":cur.lastrowid,"status":"Unverified"})
+                connected=stream_frame_readable(stream_url) if stream_url else False
+                status="Configured" if connected else ("Needs verification" if stream_url else "Unverified")
+                now=utcnow(); cur=con.execute("INSERT INTO devices(project_id,name,device_kind,vendor_model,host,port,protocol,stream_label,coverage_role,source_mode,monitoring_purposes,stream_url,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(project_id,name,device_kind,vendor,host,port,protocol,stream,coverage,source_mode,purposes_json,stream_url,status,now,now)); record_audit(con,actor,"created","device",cur.lastrowid,f"{model}; frame read" if connected else f"{model}; stream stored on server only" if stream_url else f"{model}; no stream saved",project_id); queue_automation_event(con,project_id,"device.created","device",cur.lastrowid,status.lower()); con.commit()
+                return self.send_json(201,{"id":cur.lastrowid,"status":status,"connected":connected,"model":model})
             if path == "/api/people":
                 if not self.require_permission(sess,"manage_people"): return
-                name=text(data,"display_name",120); category=choice(data,"category",("Staff","Manager","Watchlist")); position=text(data,"position",120,required=False); ref=text(data,"record_reference",120,required=False); owner=text(data,"record_owner",120); purpose=text(data,"purpose",500); review=text(data,"review_date",10)
+                name=text(data,"display_name",120); category=choice(data,"category",("Staff","Manager","Watchlist")); position=text(data,"position",120,required=False); phone=text(data,"phone",40,required=False); passport=text(data,"passport",40,required=False); address=text(data,"address",200,required=False); residence=text(data,"residence",200,required=False); ref=text(data,"record_reference",120,required=False); owner=text(data,"record_owner",120); purpose=text(data,"purpose",500); review=text(data,"review_date",10)
                 if not all((name,owner,purpose,review)): return self.send_json(400,{"error":"Name, record owner, purpose, and review date are required"})
                 if category == "Watchlist": status="Pending review"
                 else: status="Pending review"
-                now=utcnow(); cur=con.execute("INSERT INTO people(project_id,display_name,category,position,record_reference,record_owner,purpose,review_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(project_id,name,category,position,ref,owner,purpose,review,status,now,now)); record_audit(con,actor,"created","person",cur.lastrowid,f"{category} record pending review",project_id); queue_automation_event(con,project_id,"person.created","person",cur.lastrowid,"pending_review"); con.commit()
+                now=utcnow(); cur=con.execute("INSERT INTO people(project_id,display_name,category,position,phone,passport,address,residence,record_reference,record_owner,purpose,review_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(project_id,name,category,position,phone,passport,address,residence,ref,owner,purpose,review,status,now,now)); record_audit(con,actor,"created","person",cur.lastrowid,f"{category} record pending review",project_id); queue_automation_event(con,project_id,"person.created","person",cur.lastrowid,"pending_review"); con.commit()
                 return self.send_json(201,{"id":cur.lastrowid,"status":status})
             if path == "/api/alerts":
                 if not self.require_permission(sess,"review_alerts"): return
@@ -943,8 +957,15 @@ class Handler(BaseHTTPRequestHandler):
             if not project_id:return self.send_json(400,{"error":"Select a valid CCTV project"})
             if kind=="people":
                 if not self.require_permission(sess,"manage_people"): return
-                status=choice(data,"status",("Active","Inactive")); row=con.execute("SELECT category FROM people WHERE id=? AND project_id=?",(ident,project_id)).fetchone()
+                row=con.execute("SELECT category,status FROM people WHERE id=? AND project_id=?",(ident,project_id)).fetchone()
                 if not row:return self.send_json(404,{"error":"Person record not found"})
+                if "display_name" in data:
+                    name=text(data,"display_name",120); category=choice(data,"category",("Staff","Manager","Watchlist")); position=text(data,"position",120,required=False); phone=text(data,"phone",40,required=False); passport=text(data,"passport",40,required=False); address=text(data,"address",200,required=False); residence=text(data,"residence",200,required=False); ref=text(data,"record_reference",120,required=False); owner=text(data,"record_owner",120); purpose=text(data,"purpose",500); review=text(data,"review_date",10)
+                    if not all((name,owner,purpose,review)):return self.send_json(400,{"error":"Name, record owner, purpose, and review date are required"})
+                    con.execute("UPDATE people SET display_name=?,category=?,position=?,phone=?,passport=?,address=?,residence=?,record_reference=?,record_owner=?,purpose=?,review_date=?,updated_at=? WHERE id=? AND project_id=?",(name,category,position,phone,passport,address,residence,ref,owner,purpose,review,now,ident,project_id))
+                    record_audit(con,actor,"updated","person",ident,f"profile updated; category={category}",project_id); queue_automation_event(con,project_id,"person.updated","person",ident,"profile"); con.commit()
+                    return self.send_json(200,{"ok":True})
+                status=choice(data,"status",("Active","Inactive"))
                 if status=="Active" and row["category"]=="Watchlist" and not text(data,"approval_note",500):return self.send_json(400,{"error":"A documented approval note is required to activate a watchlist record"})
                 con.execute("UPDATE people SET status=?,updated_at=? WHERE id=? AND project_id=?",(status,now,ident,project_id)); record_audit(con,actor,"status_changed","person",ident,f"status={status}",project_id); queue_automation_event(con,project_id,"person.status_changed","person",ident,status.lower());
             elif kind=="devices":
@@ -1046,6 +1067,48 @@ def choice(obj: dict,key: str,allowed: tuple[str,...]) -> str:
     value=text(obj,key,80)
     if value not in allowed: raise ValueError(f"Invalid {key}")
     return value
+
+CAMERA_MODELS = {
+    "EZVIZ CS-C6N": {"user": "admin", "path": "/ch1/main"},
+    "Hikvision camera": {"path": "/Streaming/Channels/{channel}01"},
+    "Dahua camera": {"path": "/cam/realmonitor?channel={channel}&subtype=0"},
+    "Hikvision DVR/NVR": {"path": "/Streaming/Channels/{channel}01"},
+    "Dahua DVR/NVR": {"path": "/cam/realmonitor?channel={channel}&subtype=0"},
+}
+
+def camera_stream_url(model: str, host: str, port: int, username: str, secret: str, channel: int, stream_url: str) -> str:
+    """RTSP address for a known standalone camera or DVR. Other models keep the entered URL."""
+    if model in ("", "Other RTSP", "RTSP camera"):
+        return stream_url
+    spec=CAMERA_MODELS.get(model)
+    if spec is None:
+        raise ValueError("Choose a camera model")
+    if not host or any(char in host for char in " /@"):
+        raise ValueError("Enter the camera IP address")
+    if not 1<=channel<=64:
+        raise ValueError("Channel must be from 1 to 64")
+    user=(spec.get("user") or username or "admin").strip()
+    password=secret.strip()
+    if not user or not password or any(char in user+password for char in " /@"):
+        raise ValueError("Enter the camera username and password or verification code")
+    path=spec["path"].format(channel=channel)
+    return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}{path}"
+
+def stream_frame_readable(url: str) -> bool:
+    if not url:
+        return False
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]="rtsp_transport;tcp|stimeout;4000000"
+    import cv2
+    capture=cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    try:
+        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000)
+        capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000)
+        ok, frame=capture.read()
+        return bool(ok and frame is not None)
+    except Exception:
+        return False
+    finally:
+        capture.release()
 
 def watch_streams() -> None:
     import time as time_mod
